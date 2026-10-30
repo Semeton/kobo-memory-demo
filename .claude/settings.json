@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": ["Bash(php *)", "Bash(git diff*)", "Bash(git status*)", "Bash(ls *)", "Bash(grep *)", "Bash(find *)", "Bash(cat *)"]
+  }
+}
