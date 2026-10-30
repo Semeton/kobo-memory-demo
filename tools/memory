@@ -1,0 +1,415 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Repository memory: a JSONL decision log with evidence links.
+ *
+ *   php tools/memory check [--run] [--strict]  Verify every live record's evidence still exists (exit 1 on STALE or VIOLATED;
+ *                                     --strict also fails on REVIEW DUE).
+ *                                     --run also executes test evidence: a failing test marks the record VIOLATED.
+ *   php tools/memory index            Regenerate .agent/memory/INDEX.md from the log.
+ *   php tools/memory for <path>...    Records whose scope matches the given file paths.
+ *   php tools/memory show <id>...     Print records in full.
+ *   php tools/memory render [--all]   Markdown of live records (--all: every record, any status).
+ *   php tools/memory propose <json>   Append a new record as status "proposed" (needs human review).
+ *   php tools/memory propose --file <path.json>   Same, reading the record from a file (deleted afterwards).
+ *   php tools/memory accept <id>      Human only: promote a proposed record to accepted (then commit it in a PR).
+ *   php tools/memory reject <id>      Human only: mark a proposed record rejected ("don't do this again").
+ *   php tools/memory export claude    Write live records as Claude Code path-scoped rules (.claude/rules/memory/).
+ *
+ * Global flag: --no-test-evidence ignores test evidence (for checkouts that don't ship the tests).
+ *
+ * The log is the source of truth. INDEX.md is generated; never edit it by hand.
+ */
+
+define('LOG', getenv('MEMORY_LOG') ?: '.agent/memory/decisions.jsonl');
+const INDEX = '.agent/memory/INDEX.md';
+const LIVE = ['accepted', 'rejected'];
+const STATUSES = ['proposed', 'accepted', 'rejected', 'superseded', 'deprecated'];
+const KINDS = ['decision', 'constraint', 'convention', 'finding', 'rejected'];
+
+$root = realpath(__DIR__.'/..');
+$GLOBALS['argvFlags'] = array_values(array_filter($argv, fn ($a) => str_starts_with($a, '--')));
+$argv = array_values(array_filter($argv, fn ($a) => ! str_starts_with($a, '--')));
+function flag(string $f): bool
+{
+    return in_array($f, $GLOBALS['argvFlags'], true);
+}
+chdir($root);
+if (is_file('vendor/autoload.php')) {
+    require 'vendor/autoload.php';
+}
+
+function records(): array
+{
+    $out = [];
+    foreach (file(LOG, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $n => $line) {
+        $r = json_decode($line, true);
+        if (! is_array($r)) {
+            fail('Line '.($n + 1).' of '.LOG.' is not valid JSON.');
+        }
+        if (flag('--no-test-evidence')) {
+            $r['evidence'] = array_values(array_filter($r['evidence'] ?? [], fn ($e) => $e['kind'] !== 'test'));
+        }
+        $out[$r['id']] = $r;
+    }
+
+    return $out;
+}
+
+function fail(string $msg): never
+{
+    fwrite(STDERR, $msg.PHP_EOL);
+    exit(2);
+}
+
+function globToRegex(string $glob): string
+{
+    $re = '';
+    for ($i = 0, $n = strlen($glob); $i < $n; $i++) {
+        $c = $glob[$i];
+        if ($c === '*' && ($glob[$i + 1] ?? '') === '*') {
+            $re .= '.*';
+            $i++;
+            if (($glob[$i + 1] ?? '') === '/') {
+                $i++;
+                $re .= '/?';
+            }
+        } elseif ($c === '*') {
+            $re .= '[^/]*';
+        } elseif ($c === '?') {
+            $re .= '[^/]';
+        } else {
+            $re .= preg_quote($c, '#');
+        }
+    }
+
+    return '#^'.$re.'$#';
+}
+
+function matches(array $record, string $path): bool
+{
+    $path = ltrim(str_replace('\\', '/', $path), './');
+    foreach ($record['scope'] ?? [] as $glob) {
+        if (preg_match(globToRegex($glob), $path)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/** @return list<string> problems with this record's evidence (empty = healthy) */
+function evidenceProblems(array $r): array
+{
+    $problems = [];
+    foreach ($r['evidence'] ?? [] as $e) {
+        $ok = match ($e['kind']) {
+            // @: an optimised classmap can still list a deleted file; that is exactly the stale case.
+            'class' => @class_exists($e['ref']) || @interface_exists($e['ref']) || @trait_exists($e['ref']) || @enum_exists($e['ref']),
+            'path' => file_exists($e['ref']),
+            'test' => file_exists(explode('::', $e['ref'])[0]),
+            default => true,
+        };
+        if (! $ok) {
+            $problems[] = "{$e['kind']} {$e['ref']} no longer exists";
+        }
+    }
+
+    return $problems;
+}
+
+/** Execute test evidence. @return list<string> failing tests (empty = rule holds) */
+function evidenceViolations(array $r): array
+{
+    $out = [];
+    foreach ($r['evidence'] ?? [] as $e) {
+        if ($e['kind'] !== 'test') {
+            continue;
+        }
+        [$file, $filter] = array_pad(explode('::', $e['ref'], 2), 2, null);
+        if (! file_exists($file)) {
+            continue; // reported as STALE already
+        }
+        $cmd = escapeshellarg(PHP_BINARY).' vendor/bin/pest '.escapeshellarg($file).($filter ? ' --filter='.escapeshellarg($filter) : '').' --colors=never 2>&1';
+        $lines = [];
+        exec($cmd, $lines, $code);
+        if ($code !== 0) {
+            $out[] = "test {$e['ref']} fails: the code no longer follows this rule";
+        }
+    }
+
+    return $out;
+}
+
+function lint(array $all): array
+{
+    $issues = [];
+    foreach ($all as $id => $r) {
+        foreach (['id', 'kind', 'status', 'title', 'rule', 'why', 'scope', 'evidence', 'source', 'recorded'] as $f) {
+            if (! array_key_exists($f, $r)) {
+                $issues[] = "$id: missing field '$f'";
+            }
+        }
+        if (! in_array($r['status'] ?? null, STATUSES, true)) {
+            $issues[] = "$id: unknown status";
+        }
+        if (! in_array($r['kind'] ?? null, KINDS, true)) {
+            $issues[] = "$id: unknown kind";
+        }
+        if (($r['status'] ?? '') === 'superseded' && ! isset($all[$r['superseded_by'] ?? ''])) {
+            $issues[] = "$id: superseded_by points at a record that does not exist";
+        }
+        // A proposal names what it would replace; the chain is completed when a human accepts it.
+        foreach (($r['status'] ?? '') === 'proposed' ? [] : ($r['supersedes'] ?? []) as $old) {
+            if (($all[$old]['status'] ?? null) !== 'superseded') {
+                $issues[] = "$id: supersedes $old, but $old is not marked superseded";
+            }
+        }
+    }
+
+    return $issues;
+}
+
+function health(array $r, ?string $today = null): array
+{
+    $today ??= date('Y-m-d');
+    $flags = [];
+    foreach (evidenceProblems($r) as $p) {
+        $flags[] = 'STALE: '.$p;
+    }
+    if (flag('--run')) {
+        foreach (evidenceViolations($r) as $p) {
+            $flags[] = 'VIOLATED: '.$p;
+        }
+    }
+    if (in_array($r['status'], LIVE, true) && $r['kind'] !== 'rejected' && empty($r['evidence'])) {
+        $flags[] = 'UNANCHORED: no evidence to check against';
+    }
+    if (! empty($r['review_by']) && $r['review_by'] < $today) {
+        $flags[] = "REVIEW DUE: review_by {$r['review_by']} has passed";
+    }
+
+    return $flags;
+}
+
+function renderRecord(array $r): string
+{
+    $lines = ["### {$r['id']} · {$r['title']}", ''];
+    $lines[] = "- **Status:** {$r['status']} · **Kind:** {$r['kind']} · **Recorded:** {$r['recorded']} by {$r['source']['by']} ({$r['source']['ref']})";
+    if (! empty($r['superseded_by'])) {
+        $lines[] = "- **Superseded by:** {$r['superseded_by']}";
+    }
+    if (! empty($r['supersedes'])) {
+        $lines[] = '- **Supersedes:** '.implode(', ', $r['supersedes']);
+    }
+    $lines[] = '- **Applies to:** '.implode(', ', array_map(fn ($g) => "`$g`", $r['scope']));
+    $lines[] = "- **Rule:** {$r['rule']}";
+    $lines[] = "- **Why:** {$r['why']}";
+    if (! empty($r['revisit_when'])) {
+        $lines[] = "- **Revisit when:** {$r['revisit_when']}";
+    }
+    if (! empty($r['reviewed'])) {
+        $lines[] = "- **Reviewed:** {$r['reviewed']['on']} by {$r['reviewed']['by']}";
+    }
+    if ($r['evidence']) {
+        $lines[] = '- **Evidence:** '.implode(', ', array_map(fn ($e) => "{$e['kind']} `{$e['ref']}`", $r['evidence']));
+    }
+
+    return implode("\n", $lines)."\n";
+}
+
+$cmd = $argv[1] ?? 'help';
+$args = array_slice($argv, 2);
+
+switch ($cmd) {
+    case 'check':
+        $all = records();
+        $bad = 0;
+        foreach (lint($all) as $issue) {
+            echo str_pad('LINT', 11)."$issue\n";
+            $bad++;
+        }
+        foreach ($all as $id => $r) {
+            if (! in_array($r['status'], LIVE, true)) {
+                continue;
+            }
+            $flags = health($r);
+            if (! $flags) {
+                echo str_pad('OK', 11)."$id  {$r['title']}\n";
+                continue;
+            }
+            foreach ($flags as $f) {
+                echo str_pad(strtok($f, ':'), 11)."$id  ".trim(substr($f, strpos($f, ':') + 1))."\n";
+                if (str_starts_with($f, 'STALE') || str_starts_with($f, 'VIOLATED') || (flag('--strict') && str_starts_with($f, 'REVIEW DUE'))) {
+                    $bad++;
+                }
+            }
+        }
+        exit($bad > 0 ? 1 : 0);
+
+    case 'index':
+        $all = records();
+        $rows = [];
+        $rejected = [];
+        foreach ($all as $r) {
+            if (! in_array($r['status'], LIVE, true)) {
+                continue;
+            }
+            $h = health($r);
+            $warn = array_filter($h, fn ($f) => str_starts_with($f, 'STALE'));
+            $due = array_filter($h, fn ($f) => str_starts_with($f, 'REVIEW DUE'));
+            $note = $warn ? ' ⚠ evidence missing — verify before relying on it'
+                : ($due ? ' · review due: still in force, not re-confirmed — tell the developer if your change depends on it' : '');
+            if ($r['status'] === 'rejected') {
+                $rejected[] = "| {$r['id']} | {$r['title']}{$note} |";
+                continue;
+            }
+            $rows[] = '| '.implode('<br>', array_map(fn ($g) => "`$g`", $r['scope']))." | {$r['id']} | {$r['title']}{$note} |";
+        }
+        $md = "<!-- Generated by `php tools/memory index`. Do not edit by hand. -->\n";
+        $md .= "# Repository memory index\n\n";
+        $md .= "Live decisions for this codebase. Full records live in `.agent/memory/decisions.jsonl`.\n\n";
+        $md .= "Before you plan a change: match the files you expect to touch against **Applies to**, then read those records in full with `php tools/memory show <ID>` (or `php tools/memory for <path>`). For a concept that cuts across folders, grep the log.\n\n";
+        $md .= "| Applies to | Record | Title |\n|---|---|---|\n".implode("\n", $rows)."\n";
+        if ($rejected) {
+            $md .= "\n## Rejected approaches (don't reintroduce)\n\n| Record | Title |\n|---|---|\n".implode("\n", $rejected)."\n";
+        }
+        $md .= "\nSuperseded and proposed records are history or unreviewed. They are left out on purpose.\n";
+        file_put_contents(INDEX, $md);
+        echo 'Wrote '.INDEX.' ('.count($rows).' live, '.count($rejected)." rejected)\n";
+        exit(0);
+
+    case 'for':
+        $all = records();
+        foreach ($args as $path) {
+            $hits = array_filter($all, fn ($r) => in_array($r['status'], LIVE, true) && matches($r, $path));
+            echo "# $path\n".($hits ? implode("\n", array_map('renderRecord', $hits)) : "(no live records)\n")."\n";
+        }
+        exit(0);
+
+    case 'show':
+        $all = records();
+        foreach ($args as $id) {
+            echo isset($all[$id]) ? renderRecord($all[$id])."\n" : "$id: not found\n";
+        }
+        exit(0);
+
+    case 'render':
+        $all = records();
+        $everything = in_array('--all', $args, true);
+        foreach ($all as $r) {
+            if ($everything || in_array($r['status'], LIVE, true)) {
+                echo renderRecord($r)."\n";
+            }
+        }
+        exit(0);
+
+    case 'propose':
+        $fromFile = flag('--file');
+        $raw = $fromFile ? (is_file($args[0] ?? '') ? file_get_contents($args[0]) : fail('propose --file expects a path to a JSON file.')) : ($args[0] ?? '');
+        $r = json_decode($raw, true) ?: fail('propose expects a JSON object (inline, or --file <path>).');
+        unset($r['id'], $r['status']);           // the tool assigns both; agents never choose them
+        $all = records();
+        $next = max(array_map(fn ($id) => (int) preg_replace('/\D/', '', $id), array_keys($all) ?: ['0'])) + 1;
+        $r['id'] ??= 'P-'.str_pad((string) $next, 3, '0', STR_PAD_LEFT);
+        $r['status'] = 'proposed';             // agents can only propose; a human promotes
+        $r['source'] = ($r['source'] ?? []) + ['by' => 'agent', 'who' => 'unknown', 'ref' => 'unspecified'];
+        $r['recorded'] = date('Y-m-d');
+        $r += ['kind' => 'finding', 'scope' => [], 'evidence' => [], 'supersedes' => [], 'superseded_by' => null, 'review_by' => null];
+        if (isset($all[$r['id']])) {
+            fail("{$r['id']} already exists.");
+        }
+        $issues = lint([$r['id'] => $r]);
+        if ($issues) {
+            fail(implode("\n", $issues));
+        }
+        file_put_contents(LOG, json_encode($r, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n", FILE_APPEND);
+        if ($fromFile) {
+            unlink($args[0]);
+        }
+        echo "Proposed {$r['id']} (status: proposed — needs review before it reaches the index)\n";
+        exit(0);
+
+    case 'accept':
+    case 'reject':
+        // A speed bump, not a security boundary: agents can unset env vars. The real gate is PR review
+        // (e.g. CODEOWNERS on .agent/memory/). This makes the policy visible when an agent tries anyway.
+        if (getenv('CLAUDECODE') || getenv('AI_AGENT')) {
+            fail("Refused: this looks like an agent session. Agents can propose records; only a human can {$cmd} them.\nAsk the developer to run: php tools/memory {$cmd} ".($args[0] ?? '<id>'));
+        }
+        $id = $args[0] ?? fail("Usage: php tools/memory {$cmd} <id>");
+        $lines = file(LOG, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $found = false;
+        foreach ($lines as $i => $line) {
+            $r = json_decode($line, true);
+            if (($r['id'] ?? null) !== $id) {
+                continue;
+            }
+            if ($r['status'] !== 'proposed') {
+                fail("$id is {$r['status']}, not proposed.");
+            }
+            $r['status'] = $cmd === 'accept' ? 'accepted' : 'rejected';
+            if ($cmd === 'reject') {
+                $r['kind'] = 'rejected';
+            }
+            $r['reviewed'] = ['by' => trim((string) shell_exec('git config user.name')) ?: get_current_user(), 'on' => date('Y-m-d')];
+            $lines[$i] = json_encode($r, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $found = true;
+        }
+        $found || fail("$id not found.");
+        // Accepting a record retires whatever it supersedes, so both ends of the chain agree.
+        $retired = [];
+        if ($cmd === 'accept') {
+            $new = null;
+            foreach ($lines as $line) {
+                $x = json_decode($line, true);
+                if (($x['id'] ?? null) === $id) {
+                    $new = $x;
+                }
+            }
+            $olds = (array) ($new['supersedes'] ?? []);
+            foreach ($lines as $i => $line) {
+                $x = json_decode($line, true);
+                if (in_array($x['id'] ?? null, $olds, true)) {
+                    $x['status'] = 'superseded';
+                    $x['superseded_by'] = $id;
+                    $lines[$i] = json_encode($x, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                    $retired[] = $x['id'];
+                }
+            }
+        }
+        file_put_contents(LOG, implode("\n", $lines)."\n");
+        echo ($cmd === 'accept' ? 'Accepted' : 'Rejected')." $id.".($retired ? ' Superseded: '.implode(', ', $retired).'.' : '')." Run `php tools/memory index`, then commit both files in a PR.\n";
+        exit(0);
+
+    case 'export':
+        if (($args[0] ?? '') !== 'claude') {
+            fail('Usage: php tools/memory export claude');
+        }
+        $dir = '.claude/rules/memory';
+        @mkdir($dir, 0777, true);
+        array_map('unlink', glob("$dir/*.md"));
+        $n = 0;
+        foreach (records() as $r) {
+            if (! in_array($r['status'], LIVE, true)) {
+                continue;
+            }
+            $front = "---\npaths:\n".implode('', array_map(fn ($g) => "  - \"$g\"\n", $r['scope']))."---\n";
+            $stale = array_filter(health($r), fn ($f) => str_starts_with($f, 'STALE'));
+            $body = "<!-- Generated from .agent/memory/decisions.jsonl by `php tools/memory export claude`. Edit the log, not this file. -->\n";
+            $body .= $r['status'] === 'rejected' ? "# Rejected: {$r['title']} ({$r['id']})\n\nDo not reintroduce this.\n\n" : "# {$r['title']} ({$r['id']})\n\n";
+            $body .= $stale ? "> ⚠ This record's evidence is missing. Verify it before relying on it.\n\n" : '';
+            $body .= "**Rule:** {$r['rule']}\n\n**Why:** {$r['why']}\n";
+            if ($r['evidence']) {
+                $body .= "\n**Evidence:** ".implode(', ', array_map(fn ($e) => "{$e['kind']} `{$e['ref']}`", $r['evidence']))."\n";
+            }
+            file_put_contents("$dir/{$r['id']}.md", $front.$body);
+            $n++;
+        }
+        echo "Wrote $n path-scoped rules to $dir/ (Claude Code loads each one only when it works on a matching file)\n";
+        exit(0);
+
+    default:
+        echo preg_replace('/^ \* ?/m', '', explode('*/', explode('/**', file_get_contents(__FILE__), 2)[1])[0]);
+        exit(0);
+}
